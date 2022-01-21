@@ -861,16 +861,16 @@ class PerceiverModel(PerceiverPreTrainedModel):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if self.input_preprocessor is not None:
-            inputs, modality_sizes, inputs_without_pos = self.input_preprocessor(inputs)
-        else:
-            modality_sizes = None
-            inputs_without_pos = None
-            if inputs.size()[-1] != self.config.d_model:
-                raise ValueError(
-                    f"Last dimension of the inputs: {inputs.size()[-1]} doesn't correspond to config.d_model: {self.config.d_model}. "
-                    "Make sure to set config.d_model appropriately."
-                )
+        # if self.input_preprocessor is not None:
+        #     inputs, modality_sizes, inputs_without_pos = self.input_preprocessor(inputs)
+        # else:
+        # modality_sizes = None
+        # inputs_without_pos = None
+        if inputs.size()[-1] != self.config.d_model:
+            raise ValueError(
+                f"Last dimension of the inputs: {inputs.size()[-1]} doesn't correspond to config.d_model: {self.config.d_model}. "
+                "Make sure to set config.d_model appropriately."
+            )
 
         batch_size, seq_length, _ = inputs.size()
         device = inputs.device
@@ -903,37 +903,37 @@ class PerceiverModel(PerceiverPreTrainedModel):
         sequence_output = encoder_outputs[0]
 
         logits = None
-        if self.decoder:
-            if subsampled_output_points is not None:
-                output_modality_sizes = {
-                    "audio": subsampled_output_points["audio"].shape[0],
-                    "image": subsampled_output_points["image"].shape[0],
-                    "label": 1,
-                }
-            else:
-                output_modality_sizes = None
-            decoder_query = self.decoder.decoder_query(
-                inputs, modality_sizes, inputs_without_pos, subsampled_points=subsampled_output_points
-            )
-            decoder_outputs = self.decoder(
-                decoder_query,
-                z=sequence_output,
-                query_mask=extended_attention_mask,
-                output_attentions=output_attentions,
-            )
-            logits = decoder_outputs.logits
-
-            # add cross-attentions of decoder
-            if output_attentions and decoder_outputs.cross_attentions is not None:
-                if return_dict:
-                    encoder_outputs.cross_attentions = (
-                        encoder_outputs.cross_attentions + decoder_outputs.cross_attentions
-                    )
-                else:
-                    encoder_outputs = encoder_outputs + decoder_outputs.cross_attentions
-
-            if self.output_postprocessor:
-                logits = self.output_postprocessor(logits, modality_sizes=output_modality_sizes)
+        # if self.decoder:
+        #     if subsampled_output_points is not None:
+        #         output_modality_sizes = {
+        #             "audio": subsampled_output_points["audio"].shape[0],
+        #             "image": subsampled_output_points["image"].shape[0],
+        #             "label": 1,
+        #         }
+        #     else:
+        #         output_modality_sizes = None
+        #     decoder_query = self.decoder.decoder_query(
+        #         inputs, modality_sizes, inputs_without_pos, subsampled_points=subsampled_output_points
+        #     )
+        #     decoder_outputs = self.decoder(
+        #         decoder_query,
+        #         z=sequence_output,
+        #         query_mask=extended_attention_mask,
+        #         output_attentions=output_attentions,
+        #     )
+        #     logits = decoder_outputs.logits
+        #
+        #     # add cross-attentions of decoder
+        #     if output_attentions and decoder_outputs.cross_attentions is not None:
+        #         if return_dict:
+        #             encoder_outputs.cross_attentions = (
+        #                 encoder_outputs.cross_attentions + decoder_outputs.cross_attentions
+        #             )
+        #         else:
+        #             encoder_outputs = encoder_outputs + decoder_outputs.cross_attentions
+        #
+        #     if self.output_postprocessor:
+        #         logits = self.output_postprocessor(logits, modality_sizes=output_modality_sizes)
 
         if not return_dict:
             if logits is not None:
@@ -2278,6 +2278,41 @@ class PerceiverOpticalFlowDecoder(PerceiverAbstractDecoder):
         # Output flow and rescale.
         preds /= self.rescale_factor
         preds = preds.reshape([preds.shape[0]] + list(self.output_image_shape) + [preds.shape[-1]])
+        print('qwerqwerqwer', decoder_outputs.cross_attentions)
+        return PerceiverDecoderOutput(logits=preds, cross_attentions=decoder_outputs.cross_attentions)
+
+
+class PerceiverDepthDecoder(PerceiverAbstractDecoder):
+    """Cross-attention based optical flow decoder."""
+
+    def __init__(self, config, output_image_shape, output_num_channels=2,
+                 min_depth=0.1, max_depth=100.0, **decoder_kwargs):
+        super().__init__()
+
+        self.output_image_shape = output_image_shape
+        self.output_num_channels = output_num_channels
+        self.decoder = PerceiverBasicDecoder(config, output_num_channels=output_num_channels, **decoder_kwargs)
+        from vidar.arch.blocks.depth.SigmoidToInvDepth import SigmoidToInvDepth
+        self.sigmoid = torch.nn.Sigmoid()
+        self.sigmoid_to_depth = SigmoidToInvDepth(min_depth=min_depth, max_depth=max_depth, return_depth=True)
+
+    @property
+    def num_query_channels(self) -> int:
+        return self.decoder.num_query_channels
+
+    def decoder_query(self, inputs, modality_sizes=None, inputs_without_pos=None, subsampled_points=None):
+        if subsampled_points is not None:
+            raise ValueError("FlowDecoder doesn't support subsampling yet.")
+        return inputs
+
+    def forward(self, query, z, query_mask=None, output_attentions=False):
+        decoder_outputs = self.decoder(query, z, output_attentions=output_attentions)
+        preds = decoder_outputs.logits
+        # Output flow and rescale.
+        preds = preds.reshape([preds.shape[0]] + list(self.output_image_shape) + [preds.shape[-1]])
+        preds = preds.permute(0, 3, 1, 2)
+        preds = self.sigmoid(preds)
+        preds = self.sigmoid_to_depth(preds)
         return PerceiverDecoderOutput(logits=preds, cross_attentions=decoder_outputs.cross_attentions)
 
 
@@ -2563,7 +2598,7 @@ class Conv2DDownsample(nn.Module):
         )
         self.batchnorm = nn.BatchNorm2d(num_features=out_channels) if use_batchnorm else nn.Identity()
         self.relu = nn.ReLU()
-        self.max_pool = nn.MaxPool2d(kernel_size=3, stride=2)
+        self.max_pool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         out = self.conv(inputs)
@@ -2598,11 +2633,12 @@ def generate_fourier_features(pos, num_bands, max_resolution=(224, 224), concat_
     """
 
     batch_size = pos.shape[0]
+    device = pos.device
 
     min_freq = 1.0
     # Nyquist frequency at the target resolution:
     freq_bands = torch.stack(
-        [torch.linspace(start=min_freq, end=res / 2, steps=num_bands) for res in max_resolution], dim=0
+        [torch.linspace(start=min_freq, end=res / 2, steps=num_bands, device=device) for res in max_resolution], dim=0
     )
 
     # Get frequency bands for each spatial dimension.
@@ -2711,12 +2747,12 @@ def _check_or_build_spatial_positions(pos, index_dims, batch_size):
         pos = build_linear_positions(index_dims)
         pos = torch.broadcast_to(pos[None], (batch_size,) + pos.shape)
         pos = torch.reshape(pos, [batch_size, np.prod(index_dims), -1])
-    else:
-        # Just a warning label: you probably don't want your spatial features to
-        # have a different spatial layout than your pos coordinate system.
-        # But feel free to override if you think it'll work!
-        if pos.shape[-1] != len(index_dims):
-            raise ValueError("Spatial features have the wrong number of dimensions.")
+    # else:
+    #     # Just a warning label: you probably don't want your spatial features to
+    #     # have a different spatial layout than your pos coordinate system.
+    #     # But feel free to override if you think it'll work!
+    #     if pos.shape[-1] != len(index_dims):
+    #         raise ValueError("Spatial features have the wrong number of dimensions.")
     return pos
 
 
