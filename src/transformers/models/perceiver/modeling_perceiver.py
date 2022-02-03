@@ -26,6 +26,7 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from externals.transformers.adapters.outputs.upsample import upsample_tensor
 
 from ...activations import ACT2FN
 from ...file_utils import (
@@ -2282,19 +2283,23 @@ class PerceiverOpticalFlowDecoder(PerceiverAbstractDecoder):
         return PerceiverDecoderOutput(logits=preds, cross_attentions=decoder_outputs.cross_attentions)
 
 
-class PerceiverDepthDecoder(PerceiverAbstractDecoder):
+class PerceiverRGBDecoder(PerceiverAbstractDecoder):
     """Cross-attention based optical flow decoder."""
 
-    def __init__(self, config, output_image_shape, output_num_channels=2,
-                 min_depth=0.1, max_depth=100.0, **decoder_kwargs):
+    def __init__(self, config, output_num_channels=3, upsample=None, **decoder_kwargs):
         super().__init__()
 
-        self.output_image_shape = output_image_shape
         self.output_num_channels = output_num_channels
         self.decoder = PerceiverBasicDecoder(config, output_num_channels=output_num_channels, **decoder_kwargs)
-        from vidar.arch.blocks.depth.SigmoidToInvDepth import SigmoidToInvDepth
         self.sigmoid = torch.nn.Sigmoid()
-        self.sigmoid_to_depth = SigmoidToInvDepth(min_depth=min_depth, max_depth=max_depth, return_depth=True)
+
+        if upsample is not None:
+            output_num_channels_mask = 9 * upsample ** 2
+            self.decoder_mask = PerceiverBasicDecoder(
+                config, output_num_channels=output_num_channels_mask, **decoder_kwargs)
+        else:
+            self.decoder_mask = None
+        self.upsample = upsample
 
     @property
     def num_query_channels(self) -> int:
@@ -2305,15 +2310,82 @@ class PerceiverDepthDecoder(PerceiverAbstractDecoder):
             raise ValueError("FlowDecoder doesn't support subsampling yet.")
         return inputs
 
-    def forward(self, query, z, query_mask=None, output_attentions=False):
+    def forward(self, query, z, shape=None, query_mask=None, output_attentions=False):
         decoder_outputs = self.decoder(query, z, output_attentions=output_attentions)
-        preds = decoder_outputs.logits
-        # Output flow and rescale.
-        preds = preds.reshape([preds.shape[0]] + list(self.output_image_shape) + [preds.shape[-1]])
-        preds = preds.permute(0, 3, 1, 2)
-        preds = self.sigmoid(preds)
-        preds = self.sigmoid_to_depth(preds)
-        return PerceiverDecoderOutput(logits=preds, cross_attentions=decoder_outputs.cross_attentions)
+        pred = decoder_outputs.logits
+
+        if shape is not None:
+            pred = pred.reshape([pred.shape[0]] + list(shape) + [pred.shape[-1]]).permute(0, 3, 1, 2)
+
+        pred = self.sigmoid(pred)
+
+        if self.upsample is not None:
+            mask = self.decoder_mask(query, z, output_attentions=output_attentions).logits
+            if shape is not None:
+                mask = mask.reshape([mask.shape[0]] + list(shape) + [mask.shape[-1]]).permute(0, 3, 1, 2)
+            pred = upsample_tensor(pred, mask, up=self.upsample)
+
+        return PerceiverDecoderOutput(logits=pred, cross_attentions=decoder_outputs.cross_attentions)
+
+
+class PerceiverDepthDecoder(PerceiverAbstractDecoder):
+    """Cross-attention based optical flow decoder."""
+
+    def __init__(self, config, output_num_channels=1, upsample=None,
+                 min_depth=0.1, max_depth=100.0, output_mode='inv_depth', **decoder_kwargs):
+        super().__init__()
+
+        self.output_num_channels = output_num_channels
+        self.decoder = PerceiverBasicDecoder(
+            config, output_num_channels=output_num_channels, **decoder_kwargs)
+
+        if upsample is not None:
+            output_num_channels_mask = 9 * upsample ** 2
+            self.decoder_mask = PerceiverBasicDecoder(
+                config, output_num_channels=output_num_channels_mask, **decoder_kwargs)
+        else:
+            self.decoder_mask = None
+        self.upsample = upsample
+
+        self.output_mode = output_mode
+        if self.output_mode == 'inv_depth':
+            from vidar.arch.blocks.depth.SigmoidToInvDepth import SigmoidToInvDepth
+            self.sigmoid = torch.nn.Sigmoid()
+            self.sigmoid_to_depth = SigmoidToInvDepth(min_depth=min_depth, max_depth=max_depth, return_depth=True)
+        elif self.output_mode == 'log_depth':
+            from vidar.arch.blocks.depth.SigmoidToLogDepth import SigmoidToLogDepth
+            self.sigmoid_to_log_depth = SigmoidToLogDepth()
+        else:
+            raise ValueError('Invalid depth output mode')
+
+    @property
+    def num_query_channels(self) -> int:
+        return self.decoder.num_query_channels
+
+    def decoder_query(self, inputs, modality_sizes=None, inputs_without_pos=None, subsampled_points=None):
+        if subsampled_points is not None:
+            raise ValueError("FlowDecoder doesn't support subsampling yet.")
+        return inputs
+
+    def forward(self, query, z, shape=None, query_mask=None, output_attentions=False):
+        decoder_outputs = self.decoder(query, z, output_attentions=output_attentions)
+        pred = decoder_outputs.logits
+
+        if shape is not None:
+            pred = pred.reshape([pred.shape[0]] + list(shape) + [pred.shape[-1]]).permute(0, 3, 1, 2)
+
+        if self.output_mode == 'inv_depth':
+            pred = self.sigmoid_to_depth(self.sigmoid(pred))
+        elif self.output_mode == 'log_depth':
+            pred = self.sigmoid_to_log_depth(pred)
+
+        if self.upsample is not None:
+            mask = self.decoder_mask(query, z, output_attentions=output_attentions).logits
+            if shape is not None:
+                mask = mask.reshape([mask.shape[0]] + list(shape) + [mask.shape[-1]]).permute(0, 3, 1, 2)
+            pred = upsample_tensor(pred, mask, up=self.upsample)
+
+        return PerceiverDecoderOutput(logits=pred, cross_attentions=decoder_outputs.cross_attentions)
 
 
 class PerceiverBasicVideoAutoencodingDecoder(PerceiverAbstractDecoder):
